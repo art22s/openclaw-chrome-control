@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenClaw Chrome Control — Options</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container {
+      width: 480px;
+      max-width: 95%;
+    }
+    .card {
+      background: #1a1a2e;
+      border-radius: 16px;
+      padding: 40px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 30px;
+    }
+    .logo {
+      font-size: 28px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo span { font-size: 32px; }
+    .settings-btn {
+      background: none;
+      border: none;
+      color: #888;
+      font-size: 22px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .settings-btn:hover { color: #e0e0e0; background: #2a2a4a; }
+    h2 { font-size: 22px; margin-bottom: 12px; color: #fff; }
+    p { color: #999; line-height: 1.6; margin-bottom: 20px; }
+    .step-indicator {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 30px;
+    }
+    .step-dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #333;
+      transition: background 0.3s;
+    }
+    .step-dot.active { background: #e94560; }
+    .step-dot.done { background: #4caf50; }
+    input[type="text"] {
+      width: 100%;
+      padding: 12px 16px;
+      background: #0f0f1a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #e0e0e0;
+      font-size: 14px;
+      margin-bottom: 16px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus { border-color: #e94560; }
+    .btn {
+      display: inline-block;
+      padding: 12px 28px;
+      border-radius: 8px;
+      border: none;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: #e94560;
+      color: #fff;
+    }
+    .btn-primary:hover { background: #d63851; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-secondary {
+      background: #2a2a4a;
+      color: #e0e0e0;
+    }
+    .btn-secondary:hover { background: #3a3a5a; }
+    .btn-row {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+      margin-top: 20px;
+    }
+    .test-result {
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-top: 12px;
+      margin-bottom: 16px;
+      font-weight: 600;
+    }
+    .test-result.success { background: #1b3a1b; color: #4caf50; }
+    .test-result.failure { background: #3a1b1b; color: #f44336; }
+    .field-group { margin-bottom: 20px; }
+    .field-label {
+      display: block;
+      font-size: 13px;
+      color: #888;
+      margin-bottom: 6px;
+    }
+    .field-hint {
+      font-size: 12px;
+      color: #666;
+      margin-top: 4px;
+    }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="header">
+        <div class="logo"><span>🦞</span> OpenClaw Chrome Control</div>
+        <button class="settings-btn hidden" id="settingsToggle" title="Settings">⚙️</button>
+      </div>
+
+      <!-- Wizard Steps -->
+      <div id="wizard">
+        <div class="step-indicator" id="stepIndicator">
+          <div class="step-dot active" data-step="1"></div>
+          <div class="step-dot" data-step="2"></div>
+          <div class="step-dot" data-step="3"></div>
+          <div class="step-dot" data-step="4"></div>
+        </div>
+
+        <!-- Step 1: Welcome -->
+        <div id="step1" class="step-content">
+          <h2>Welcome! 👋</h2>
+          <p>This extension lets OpenClaw AI control your Chrome browser — clicking, typing, reading pages, and more.</p>
+          <p>Let's get you set up in 3 quick steps.</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnNext1">Next →</button>
+          </div>
+        </div>
+
+        <!-- Step 2: Relay Test -->
+        <div id="step2" class="step-content hidden">
+          <h2>Connect to Relay Server 📡</h2>
+          <p>The relay server bridges the extension and OpenClaw. Make sure it's running, then test the connection.</p>
+          <div class="field-group">
+            <label class="field-label">Relay WebSocket URL</label>
+            <input type="text" id="relayUrlInput" value="ws://localhost:9224" placeholder="ws://localhost:9224">
+          </div>
+          <button class="btn btn-secondary" id="btnTestRelay">Test Connection</button>
+          <div id="relayTestResult"></div>
+          <div class="btn-row">
+            <button class="btn btn-secondary" id="btnBack2">← Back</button>
+            <button class="btn btn-primary" id="btnNext2" disabled>Next →</button>
+          </div>
+        </div>
+
+        <!-- Step 3: Gateway Test -->
+        <div id="step3" class="step-content hidden">
+          <h2>Test Gateway Connection 🔌</h2>
+          <p>Test your OpenClaw gateway connection. This goes through the relay server — no manual configuration needed.</p>
+          <button class="btn btn-secondary" id="btnTestGateway">Test Gateway Connection</button>
+          <div id="gatewayTestResult"></div>
+          <div class="btn-row">
+            <button class="btn btn-secondary" id="btnBack3">← Back</button>
+            <button class="btn btn-primary" id="btnNext3" disabled>Next →</button>
+          </div>
+        </div>
+
+        <!-- Step 4: Done -->
+        <div id="step4" class="step-content hidden">
+          <h2>You're All Set! 🎉</h2>
+          <p>OpenClaw Chrome Control is ready. The extension will automatically connect to the relay when Chrome starts.</p>
+          <p>You can use the side panel (click the extension icon → side panel) to chat with OpenClaw, or let it control your browser directly.</p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnFinish">🦞 Let's Go!</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings View -->
+      <div id="settings" class="hidden">
+        <h2>Settings ⚙️</h2>
+
+        <div class="field-group">
+          <label class="field-label">Relay WebSocket URL</label>
+          <input type="text" id="settingsRelayUrl" value="ws://localhost:9224">
+          <button class="btn btn-secondary" id="btnTestRelaySettings" style="margin-top: 8px;">Test Relay</button>
+          <div id="settingsRelayTestResult"></div>
+        </div>
+
+        <div class="field-group">
+          <label class="field-label">Gateway Connection</label>
+          <p class="field-hint">Tested via relay server — no manual configuration needed</p>
+          <button class="btn btn-secondary" id="btnTestGatewaySettings">Test Gateway</button>
+          <div id="settingsGatewayTestResult"></div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btnSaveSettings">Save Settings</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>

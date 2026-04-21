@@ -1,0 +1,13 @@
+{
+  "name": "openclaw-chrome-relay",
+  "version": "0.1.0",
+  "description": "WebSocket relay server for OpenClaw Chrome Control",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}

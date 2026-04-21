@@ -1,0 +1,23 @@
+/* OpenClaw Chrome Control — Content Style */
+
+.openclaw-highlight {
+  outline: 3px solid #e94560 !important;
+  outline-offset: 2px !important;
+  animation: openclaw-pulse 1s ease-in-out 3 !important;
+  position: relative !important;
+}
+
+.openclaw-highlight::after {
+  content: '🦞' !important;
+  position: absolute !important;
+  top: -20px !important;
+  right: -20px !important;
+  font-size: 14px !important;
+  z-index: 99999 !important;
+}
+
+@keyframes openclaw-pulse {
+  0% { outline-color: #e94560; }
+  50% { outline-color: #ff6b6b; }
+  100% { outline-color: #e94560; }
+}
