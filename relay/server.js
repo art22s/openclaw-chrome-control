@@ -142,26 +142,25 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ── Chat handler — agent loop with browser control ────────────────────────
+// ── Chat handler — command interpreter with optional LLM ─────────────────
 
-const BROWSER_SYSTEM_PROMPT = `You are an AI assistant that can control the user's Chrome browser in real time. You have access to the following tools:
+const CHAT_SYSTEM_PROMPT = `You are a browser control assistant. When the user asks you to do something in their browser, respond with a JSON command in this exact format:
 
-- navigate: Go to a URL. {"action":"navigate","url":"https://..."}
-- click: Click an element. {"action":"click","target":{"text":"Sign in"}} or {"action":"click","target":{"selector":"button.submit"}}
-- type: Type text into an input. {"action":"type","target":{"selector":"input[name=q]"},"value":"search term"}
-- read: Read the current page content. {"action":"read"}
-- screenshot: Take a screenshot. {"action":"screenshot"}
-- scroll: Scroll the page. {"action":"scroll","value":"down","amount":300}
-- press: Press a key. {"action":"press","value":"Enter"}
-- select: Select a dropdown option. {"action":"select","target":{"selector":"select.country"},"value":"US"}
-- wait: Wait for an element. {"action":"wait","target":{"text":"Results"},"timeout":5000}
-- list_tabs: List open tabs. {"action":"list_tabs"}
-- switch_tab: Switch to a tab. {"action":"switch_tab","tabId":123}
-- close_tab: Close a tab. {"action":"close_tab","tabId":123}
+CMD: {"action":"...","url":"...","target":{...},"value":"..."}
 
-When the user asks you to do something in the browser, use these tools to accomplish it. To decide what to do, first read the page or list tabs to understand the current state. Then take actions step by step.
+Available actions: navigate, click, type, read, screenshot, scroll, press, select, wait, list_tabs, switch_tab, close_tab.
 
-Respond in tool_call format when you want to use a tool, and plain text when talking to the user. Keep responses concise.`;
+Examples:
+- "go to google.com" → CMD: {"action":"navigate","url":"https://google.com"}
+- "click the login button" → CMD: {"action":"click","target":{"text":"login"}}
+- "type hello in the search box" → CMD: {"action":"type","target":{"selector":"input[type=search]"},"value":"hello"}
+- "read the page" → CMD: {"action":"read"}
+- "scroll down" → CMD: {"action":"scroll","value":"down","amount":300}
+- "what tabs are open" → CMD: {"action":"list_tabs"}
+- "press enter" → CMD: {"action":"press","value":"Enter"}
+
+If the user is just chatting (not asking to control the browser), respond normally without CMD.
+If you need to see the page first, use read. Keep responses concise.`;
 
 const chatSessions = new Map(); // ws -> conversation history
 
@@ -169,169 +168,160 @@ async function handleChat(ws, msg) {
   try {
     // Maintain conversation history
     if (!chatSessions.has(ws)) {
-      chatSessions.set(ws, [{ role: 'system', content: BROWSER_SYSTEM_PROMPT }]);
+      chatSessions.set(ws, [{ role: 'system', content: CHAT_SYSTEM_PROMPT }]);
     }
     const history = chatSessions.get(ws);
     history.push({ role: 'user', content: msg.message });
 
-    // Keep history manageable (last 20 messages + system)
+    // Keep history manageable
     if (history.length > 22) {
       const system = history[0];
       history.length = 0;
       history.push(system, ...history.slice(-21));
     }
 
-    // Agent loop: call LLM, execute tool calls, repeat
-    let loopCount = 0;
-    const MAX_LOOPS = 10;
-    let lastAssistantMsg = null;
+    const headers = { 'Content-Type': 'application/json' };
+    if (OPENCLAW_API_TOKEN) {
+      headers['Authorization'] = `Bearer ${OPENCLAW_API_TOKEN}`;
+    }
 
-    while (loopCount < MAX_LOOPS) {
-      loopCount++;
-
-      const headers = { 'Content-Type': 'application/json' };
-      if (OPENCLAW_API_TOKEN) {
-        headers['Authorization'] = `Bearer ${OPENCLAW_API_TOKEN}`;
-      }
-
-      const res = await fetch(OPENCLAW_API_URL + '/v1/chat/completions', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          model: 'openclaw',
-          messages: history,
-          stream: true,
-          tools: [
-            {
-              type: 'function',
-              function: {
-                name: 'browser_action',
-                description: 'Execute a browser action. Available actions: navigate, click, type, read, screenshot, scroll, press, select, wait, list_tabs, switch_tab, close_tab. Pass the action and its parameters.',
-                parameters: {
-                  type: 'object',
-                  properties: {
-                    action: { type: 'string', description: 'The action to perform' },
-                    url: { type: 'string', description: 'URL for navigate action' },
-                    target: { type: 'object', description: 'Element target (selector, text, xpath, coordinates)' },
-                    value: { type: 'string', description: 'Value for type/select/press/scroll actions' },
-                    amount: { type: 'number', description: 'Amount for scroll' },
-                    options: { type: 'object', description: 'Additional options' },
-                    tabId: { type: 'number', description: 'Tab ID for switch_tab/close_tab' },
-                  },
-                  required: ['action'],
-                },
-              },
-            },
-          ],
-        }),
-      });
-
-      if (!res.ok) {
-        const errText = await res.text().catch(() => '');
-        ws.send(JSON.stringify({ type: 'chat_error', error: `Gateway returned ${res.status}: ${errText}` }));
-        return;
-      }
-
-      // Collect the full response (streaming to client in parallel)
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let fullContent = '';
-      let toolCalls = [];
-      let currentToolCall = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (data === '[DONE]') continue;
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta;
-            if (!delta) continue;
-
-            // Text content
-            if (delta.content) {
-              fullContent += delta.content;
-              ws.send(JSON.stringify({ type: 'chat_response', content: delta.content }));
-            }
-
-            // Tool calls
-            if (delta.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                if (tc.index !== undefined) {
-                  if (!toolCalls[tc.index]) {
-                    toolCalls[tc.index] = { id: tc.id, function: { name: '', arguments: '' } };
-                  }
-                  if (tc.id) toolCalls[tc.index].id = tc.id;
-                  if (tc.function?.name) toolCalls[tc.index].function.name += tc.function.name;
-                  if (tc.function?.arguments) toolCalls[tc.index].function.arguments += tc.function.arguments;
-                }
-              }
-            }
-          } catch {
-            // skip malformed chunks
-          }
-        }
-      }
-
-      // Add assistant message to history
-      const assistantMsg = { role: 'assistant', content: fullContent || null };
-      if (toolCalls.length > 0) {
-        assistantMsg.tool_calls = toolCalls.filter(Boolean);
-      }
-      history.push(assistantMsg);
-
-      // No tool calls — we're done
-      if (toolCalls.length === 0) {
+    // First, try to directly execute if user message matches a simple command pattern
+    const directCmd = parseDirectCommand(msg.message);
+    if (directCmd) {
+      if (!connections.extension) {
+        ws.send(JSON.stringify({ type: 'chat_response', content: '⚠️ Browser extension not connected.' }));
         ws.send(JSON.stringify({ type: 'chat_response', content: '', done: true }));
         return;
       }
-
-      // Execute tool calls
-      for (const tc of toolCalls.filter(Boolean)) {
-        try {
-          const args = JSON.parse(tc.function.arguments);
-          const action = args.action || tc.function.name;
-
-          // Check extension is connected
-          if (!connections.extension) {
-            const errMsg = { role: 'tool', tool_call_id: tc.id, content: 'Error: Browser extension not connected' };
-            history.push(errMsg);
-            ws.send(JSON.stringify({ type: 'chat_response', content: '\n⚠️ Browser extension not connected.\n' }));
-            continue;
-          }
-
-          // Send command to extension and wait for response
-          const result = await sendCommandToExtension(args);
-          const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
-          history.push({ role: 'tool', tool_call_id: tc.id, content: resultStr || 'Done' });
-
-          // Show brief action indicator in chat
-          const shortResult = resultStr?.length > 200 ? resultStr.slice(0, 200) + '...' : resultStr;
-          ws.send(JSON.stringify({ type: 'chat_response', content: `\n📎 [${action}] ${shortResult}\n\n` }));
-        } catch (err) {
-          history.push({ role: 'tool', tool_call_id: tc.id, content: `Error: ${err.message}` });
-          ws.send(JSON.stringify({ type: 'chat_response', content: `\n❌ Tool error: ${err.message}\n` }));
-        }
+      ws.send(JSON.stringify({ type: 'chat_response', content: `📎 Executing: ${directCmd.action}...\n` }));
+      try {
+        const result = await sendCommandToExtension(directCmd);
+        const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+        const shortResult = resultStr?.length > 500 ? resultStr.slice(0, 500) + '...' : resultStr;
+        ws.send(JSON.stringify({ type: 'chat_response', content: `✅ Result: ${shortResult}\n` }));
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'chat_response', content: `❌ Error: ${err.message}\n` }));
       }
-
-      // Clear toolCalls for next iteration
-      toolCalls = [];
+      ws.send(JSON.stringify({ type: 'chat_response', content: '', done: true }));
+      return;
     }
 
-    // Hit max loops
-    ws.send(JSON.stringify({ type: 'chat_response', content: '\n⚠️ Reached maximum action limit. Stopping.', done: true }));
+    // Otherwise, use LLM to interpret the message
+    const res = await fetch(OPENCLAW_API_URL + '/v1/chat/completions', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: 'openclaw',
+        messages: history,
+        stream: true,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      ws.send(JSON.stringify({ type: 'chat_error', error: `Gateway returned ${res.status}: ${errText}` }));
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullContent = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          const content = parsed.choices?.[0]?.delta?.content || '';
+          if (content) {
+            fullContent += content;
+            // Don't stream CMD: lines to the client
+            if (!content.match(/^CMD:/)) {
+              ws.send(JSON.stringify({ type: 'chat_response', content }));
+            }
+          }
+        } catch {
+          // skip malformed chunks
+        }
+      }
+    }
+
+    // Check if the LLM response contains a CMD: to execute
+    const cmdMatch = fullContent.match(/CMD:\s*({[\s\S]*?})/);
+    if (cmdMatch && connections.extension) {
+      try {
+        const cmd = JSON.parse(cmdMatch[1]);
+        // Strip the CMD line from what was streamed to the user
+        ws.send(JSON.stringify({ type: 'chat_response', content: '\n📎 Executing: ' + cmd.action + '...\n' }));
+        const result = await sendCommandToExtension(cmd);
+        const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+        const shortResult = resultStr?.length > 500 ? resultStr.slice(0, 500) + '...' : resultStr;
+        ws.send(JSON.stringify({ type: 'chat_response', content: '✅ ' + shortResult + '\n' }));
+        history.push({ role: 'assistant', content: fullContent });
+        history.push({ role: 'user', content: `[Browser result for ${cmd.action}]: ${shortResult}` });
+      } catch (err) {
+        ws.send(JSON.stringify({ type: 'chat_response', content: `\n❌ Error: ${err.message}\n` }));
+      }
+    } else {
+      history.push({ role: 'assistant', content: fullContent });
+    }
+
+    ws.send(JSON.stringify({ type: 'chat_response', content: '', done: true }));
   } catch (err) {
     ws.send(JSON.stringify({ type: 'chat_error', error: err.message }));
   }
+}
+
+// Parse simple direct commands from user message
+function parseDirectCommand(message) {
+  const msg = message.toLowerCase().trim();
+
+  // Navigate
+  const navMatch = msg.match(/^(?:go to|navigate to|open)\s+(https?:\/\/\S+|\S+\.\S+)/i);
+  if (navMatch) {
+    let url = navMatch[1];
+    if (!url.startsWith('http')) url = 'https://' + url;
+    return { action: 'navigate', url };
+  }
+
+  // Read page
+  if (/^(?:read|show|what(?:'s| is) on) (?:the )?(?:page|tab|screen)/i.test(msg)) return { action: 'read' };
+  if (/^read$/i.test(msg)) return { action: 'read' };
+
+  // List tabs
+  if (/(?:list|show|what) ?(?:tabs?|windows?)/i.test(msg)) return { action: 'list_tabs' };
+  if (/^tabs$/i.test(msg)) return { action: 'list_tabs' };
+
+  // Screenshot
+  if (/^(?:screenshot|screen capture|capture)/i.test(msg)) return { action: 'screenshot' };
+
+  // Scroll
+  const scrollMatch = msg.match(/^scroll\s+(up|down|left|right)(?:\s+(\d+))?/i);
+  if (scrollMatch) return { action: 'scroll', value: scrollMatch[1].toLowerCase(), amount: parseInt(scrollMatch[2]) || 300 };
+
+  // Press key
+  const pressMatch = msg.match(/^press\s+(enter|tab|escape|backspace|delete)/i);
+  if (pressMatch) return { action: 'press', value: pressMatch[1].charAt(0).toUpperCase() + pressMatch[1].slice(1).toLowerCase() };
+
+  // Click
+  const clickMatch = msg.match(/^click\s+["']?(.+?)["']?$/i);
+  if (clickMatch) return { action: 'click', target: { text: clickMatch[1] } };
+
+  // Type
+  const typeMatch = msg.match(/^type\s+["'](.+?)["']\s+(?:in|into|on)\s+["']?(.+?)["']?$/i);
+  if (typeMatch) return { action: 'type', value: typeMatch[1], target: { text: typeMatch[2] } };
+
+  return null;
 }
 
 // Send a command to the extension and wait for the response
