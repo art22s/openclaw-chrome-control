@@ -134,6 +134,7 @@ wss.on('connection', (ws, req) => {
       connections[ws._role] = null;
       broadcastStatus();
     }
+    chatSessions.delete(ws);
   });
 
   ws.on('error', (err) => {
@@ -141,63 +142,227 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ── Chat handler — streams from OpenClaw Gateway API ──────────────────────
+// ── Chat handler — agent loop with browser control ────────────────────────
+
+const BROWSER_SYSTEM_PROMPT = `You are an AI assistant that can control the user's Chrome browser in real time. You have access to the following tools:
+
+- navigate: Go to a URL. {"action":"navigate","url":"https://..."}
+- click: Click an element. {"action":"click","target":{"text":"Sign in"}} or {"action":"click","target":{"selector":"button.submit"}}
+- type: Type text into an input. {"action":"type","target":{"selector":"input[name=q]"},"value":"search term"}
+- read: Read the current page content. {"action":"read"}
+- screenshot: Take a screenshot. {"action":"screenshot"}
+- scroll: Scroll the page. {"action":"scroll","value":"down","amount":300}
+- press: Press a key. {"action":"press","value":"Enter"}
+- select: Select a dropdown option. {"action":"select","target":{"selector":"select.country"},"value":"US"}
+- wait: Wait for an element. {"action":"wait","target":{"text":"Results"},"timeout":5000}
+- list_tabs: List open tabs. {"action":"list_tabs"}
+- switch_tab: Switch to a tab. {"action":"switch_tab","tabId":123}
+- close_tab: Close a tab. {"action":"close_tab","tabId":123}
+
+When the user asks you to do something in the browser, use these tools to accomplish it. To decide what to do, first read the page or list tabs to understand the current state. Then take actions step by step.
+
+Respond in tool_call format when you want to use a tool, and plain text when talking to the user. Keep responses concise.`;
+
+const chatSessions = new Map(); // ws -> conversation history
 
 async function handleChat(ws, msg) {
   try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (OPENCLAW_API_TOKEN) {
-      headers['Authorization'] = `Bearer ${OPENCLAW_API_TOKEN}`;
+    // Maintain conversation history
+    if (!chatSessions.has(ws)) {
+      chatSessions.set(ws, [{ role: 'system', content: BROWSER_SYSTEM_PROMPT }]);
+    }
+    const history = chatSessions.get(ws);
+    history.push({ role: 'user', content: msg.message });
+
+    // Keep history manageable (last 20 messages + system)
+    if (history.length > 22) {
+      const system = history[0];
+      history.length = 0;
+      history.push(system, ...history.slice(-21));
     }
 
-    const res = await fetch(OPENCLAW_API_URL + '/v1/chat/completions', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: 'openclaw',
-        messages: [{ role: 'user', content: msg.message }],
-        stream: true,
-      }),
-    });
+    // Agent loop: call LLM, execute tool calls, repeat
+    let loopCount = 0;
+    const MAX_LOOPS = 10;
+    let lastAssistantMsg = null;
 
-    if (!res.ok) {
-      ws.send(JSON.stringify({ type: 'chat_error', error: `Gateway returned ${res.status}` }));
-      return;
-    }
+    while (loopCount < MAX_LOOPS) {
+      loopCount++;
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+      const headers = { 'Content-Type': 'application/json' };
+      if (OPENCLAW_API_TOKEN) {
+        headers['Authorization'] = `Bearer ${OPENCLAW_API_TOKEN}`;
+      }
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+      const res = await fetch(OPENCLAW_API_URL + '/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'openclaw',
+          messages: history,
+          stream: true,
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'browser_action',
+                description: 'Execute a browser action. Available actions: navigate, click, type, read, screenshot, scroll, press, select, wait, list_tabs, switch_tab, close_tab. Pass the action and its parameters.',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    action: { type: 'string', description: 'The action to perform' },
+                    url: { type: 'string', description: 'URL for navigate action' },
+                    target: { type: 'object', description: 'Element target (selector, text, xpath, coordinates)' },
+                    value: { type: 'string', description: 'Value for type/select/press/scroll actions' },
+                    amount: { type: 'number', description: 'Amount for scroll' },
+                    options: { type: 'object', description: 'Additional options' },
+                    tabId: { type: 'number', description: 'Tab ID for switch_tab/close_tab' },
+                  },
+                  required: ['action'],
+                },
+              },
+            },
+          ],
+        }),
+      });
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        ws.send(JSON.stringify({ type: 'chat_error', error: `Gateway returned ${res.status}: ${errText}` }));
+        return;
+      }
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') {
-          ws.send(JSON.stringify({ type: 'chat_response', content: '', done: true }));
-          continue;
-        }
-        try {
-          const parsed = JSON.parse(data);
-          const content = parsed.choices?.[0]?.delta?.content || '';
-          if (content) {
-            ws.send(JSON.stringify({ type: 'chat_response', content }));
+      // Collect the full response (streaming to client in parallel)
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let fullContent = '';
+      let toolCalls = [];
+      let currentToolCall = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6).trim();
+          if (data === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(data);
+            const delta = parsed.choices?.[0]?.delta;
+            if (!delta) continue;
+
+            // Text content
+            if (delta.content) {
+              fullContent += delta.content;
+              ws.send(JSON.stringify({ type: 'chat_response', content: delta.content }));
+            }
+
+            // Tool calls
+            if (delta.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                if (tc.index !== undefined) {
+                  if (!toolCalls[tc.index]) {
+                    toolCalls[tc.index] = { id: tc.id, function: { name: '', arguments: '' } };
+                  }
+                  if (tc.id) toolCalls[tc.index].id = tc.id;
+                  if (tc.function?.name) toolCalls[tc.index].function.name += tc.function.name;
+                  if (tc.function?.arguments) toolCalls[tc.index].function.arguments += tc.function.arguments;
+                }
+              }
+            }
+          } catch {
+            // skip malformed chunks
           }
-        } catch {
-          // skip malformed chunks
         }
       }
+
+      // Add assistant message to history
+      const assistantMsg = { role: 'assistant', content: fullContent || null };
+      if (toolCalls.length > 0) {
+        assistantMsg.tool_calls = toolCalls.filter(Boolean);
+      }
+      history.push(assistantMsg);
+
+      // No tool calls — we're done
+      if (toolCalls.length === 0) {
+        ws.send(JSON.stringify({ type: 'chat_response', content: '', done: true }));
+        return;
+      }
+
+      // Execute tool calls
+      for (const tc of toolCalls.filter(Boolean)) {
+        try {
+          const args = JSON.parse(tc.function.arguments);
+          const action = args.action || tc.function.name;
+
+          // Check extension is connected
+          if (!connections.extension) {
+            const errMsg = { role: 'tool', tool_call_id: tc.id, content: 'Error: Browser extension not connected' };
+            history.push(errMsg);
+            ws.send(JSON.stringify({ type: 'chat_response', content: '\n⚠️ Browser extension not connected.\n' }));
+            continue;
+          }
+
+          // Send command to extension and wait for response
+          const result = await sendCommandToExtension(args);
+          const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+          history.push({ role: 'tool', tool_call_id: tc.id, content: resultStr || 'Done' });
+
+          // Show brief action indicator in chat
+          const shortResult = resultStr?.length > 200 ? resultStr.slice(0, 200) + '...' : resultStr;
+          ws.send(JSON.stringify({ type: 'chat_response', content: `\n📎 [${action}] ${shortResult}\n\n` }));
+        } catch (err) {
+          history.push({ role: 'tool', tool_call_id: tc.id, content: `Error: ${err.message}` });
+          ws.send(JSON.stringify({ type: 'chat_response', content: `\n❌ Tool error: ${err.message}\n` }));
+        }
+      }
+
+      // Clear toolCalls for next iteration
+      toolCalls = [];
     }
+
+    // Hit max loops
+    ws.send(JSON.stringify({ type: 'chat_response', content: '\n⚠️ Reached maximum action limit. Stopping.', done: true }));
   } catch (err) {
     ws.send(JSON.stringify({ type: 'chat_error', error: err.message }));
   }
+}
+
+// Send a command to the extension and wait for the response
+function sendCommandToExtension(cmd) {
+  return new Promise((resolve, reject) => {
+    const id = Date.now().toString() + Math.random().toString(36).slice(2);
+    const command = { type: 'command', id, ...cmd };
+
+    const timeout = setTimeout(() => {
+      connections.extension?.removeListener('message', responseHandler);
+      reject(new Error('Extension response timeout'));
+    }, 30000);
+
+    function responseHandler(raw) {
+      let resp;
+      try { resp = JSON.parse(raw.toString()); } catch { return; }
+      if (resp.type === 'response' && resp.id === id) {
+        clearTimeout(timeout);
+        connections.extension.removeListener('message', responseHandler);
+        resolve(resp.payload);
+      }
+    }
+
+    if (!connections.extension) {
+      reject(new Error('Extension not connected'));
+      return;
+    }
+
+    connections.extension.on('message', responseHandler);
+    connections.extension.send(JSON.stringify(command));
+  });
 }
 
 // ── HTTP Server (for CLI client & health checks) ─────────────────────────
