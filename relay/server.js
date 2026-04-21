@@ -154,7 +154,7 @@ async function handleChat(ws, msg) {
       method: 'POST',
       headers,
       body: JSON.stringify({
-        model: 'default',
+        model: 'openclaw',
         messages: [{ role: 'user', content: msg.message }],
         stream: true,
       }),
